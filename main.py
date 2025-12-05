@@ -1,193 +1,372 @@
-import cv2
 import os
-import time
 import json
+from datetime import datetime
+import time
+
+import cv2
 import numpy as np
+import requests
 from ultralytics import YOLO
+from google import genai
+from PIL import Image
+from dotenv import load_dotenv
 
-VIDEO_SOURCE_URL = "rtsp://admin:Armat456321@194.26.239.249:555/Streaming/Channels/101" 
-YOLO_MODEL_PATH = "yolov8n.pt" 
+# ============== ОКРУЖЕНИЕ ==============
 
-TRUCK_CLASS_ID = 7 
-CONFIDENCE_THRESHOLD = 0.55 
-CENTER_ZONE_START_X = 0.4 
-CENTER_ZONE_END_X = 0.6 
-SNAPSHOT_DIR = "snapshots"
-DISPLAY_WIDTH = 1280 
+load_dotenv()
+
+if not os.getenv("GEMINI_API_KEY"):
+    raise RuntimeError(
+        "Переменная GEMINI_API_KEY не найдена. "
+        "Создай файл .env с строкой: GEMINI_API_KEY=ТВОЙ_КЛЮЧ"
+    )
+
+gemini_client = genai.Client()
+
+# ============== НАСТРОЙКИ ==============
+
+VIDEO_SOURCE_URL = "rtsp://admin:Armat456321@194.26.239.249:555/Streaming/Channels/101"
+YOLO_MODEL_PATH = "yolov8n.pt"
+
+TRUCK_CLASS_ID = 7
+CONFIDENCE_THRESHOLD = 0.55
+
+CENTER_ZONE_START_X = 0.35
+CENTER_ZONE_END_X = 0.65
+CENTER_LINE_X = 0.5  # жёлтая линия
+
+SNAPSHOT_BASE_DIR = "snapshots"
+
+# размер окна отображения
+DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
 
-HISTORY_LENGTH = 15 
-MAX_HISTORY = 50 
+# порог для «движется вправо»
+MIN_DIRECTION_DELTA = 5
 
-if not os.path.exists(SNAPSHOT_DIR):
-    os.makedirs(SNAPSHOT_DIR)
+GEMINI_MODEL = "gemini-2.5-flash"
 
-try:
-    yolo_model = YOLO(YOLO_MODEL_PATH)
-    print(f"✅ Модель YOLO загружена: {YOLO_MODEL_PATH}")
-except Exception as e:
-    print(f"❌ Ошибка загрузки модели YOLO: {e}")
-    exit()
+# бекенд SnowOps
+BACKEND_ENDPOINT = "https://snowops-anpr-service.onrender.com/api/v1/anpr/events"
+CAMERA_ID = "camera-001"   # поменяешь на реальный ID камеры
 
-def get_cargo_bbox(truck_bbox: list, direction: str) -> list:
-    x1, y1, x2, y2 = map(int, truck_bbox)
-    w = x2 - x1
-    h = y2 - y1
-    
-    CAB_CUT_RATIO = 0.38
-    VERTICAL_PAD = 0.08
-
-    y1_cargo = y1 + int(h * VERTICAL_PAD)
-    y2_cargo = y2 - int(h * VERTICAL_PAD)
-
-    if direction == "Вправо":
-        x1_cargo = x1
-        x2_cargo = x2 - int(w * CAB_CUT_RATIO) 
-    else: 
-        x1_cargo = x1 + int(w * CAB_CUT_RATIO)
-        x2_cargo = x2
-        
-    return [x1_cargo, y1_cargo, x2_cargo, y2_cargo]
+# =======================================
 
 
-def calculate_snow_volume(frame: np.ndarray, cargo_bbox: list) -> float:
-    cx1, cy1, cx2, cy2 = map(int, cargo_bbox)
-    
-    cargo_area = frame[cy1:cy2, cx1:cx2]
-    
-    if cargo_area.size == 0:
-        return 0.0
-
-    hsv_area = cv2.cvtColor(cargo_area, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0, 0, 180])
-    upper_white = np.array([179, 70, 255])
-    snow_mask = cv2.inRange(hsv_area, lower_white, upper_white)
-    
-    snow_points = cv2.findNonZero(snow_mask)
-    
-    if snow_points is None:
-        return 0.0 
-
-    min_y_snow_rel = np.min(snow_points[:, :, 1]) 
-    
-    H_cargo = cy2 - cy1
-    H_snow = H_cargo - min_y_snow_rel
-    
-    volume_ratio = H_snow / H_cargo
-    
-    return min(max(volume_ratio, 0.0), 1.0) 
+def init_model() -> YOLO:
+    model = YOLO(YOLO_MODEL_PATH)
+    return model
 
 
-def determine_direction_by_history(history: list) -> str:
-    if len(history) < HISTORY_LENGTH:
-        return "Неизвестно"
-    
-    first_x = history[0]
-    current_x = history[-1]
-    
-    MOVEMENT_THRESHOLD = 5 
-    
-    if current_x - first_x > MOVEMENT_THRESHOLD:
-        return "Вправо"
-    elif first_x - current_x > MOVEMENT_THRESHOLD:
-        return "Влево"
-    else:
-        return "Стоит" 
+def detect_truck_bbox(frame: np.ndarray, model: YOLO):
+    """
+    Находит bbox грузовика (truck).
+    Возвращает (x1, y1, x2, y2) или None.
+    """
+    results = model(frame, verbose=False)
+    best_box = None
+    best_area = 0.0
+
+    for r in results:
+        boxes = r.boxes
+        if boxes is None:
+            continue
+
+        for b in boxes:
+            cls_id = int(b.cls[0].item())
+            conf = float(b.conf[0].item())
+
+            if cls_id != TRUCK_CLASS_ID or conf < CONFIDENCE_THRESHOLD:
+                continue
+
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            area = (x2 - x1) * (y2 - y1)
+
+            if area > best_area:
+                best_area = area
+                best_box = (x1, y1, x2, y2)
+
+    return best_box
+
+
+def check_center_zone(bbox, frame_width: int):
+    """
+    Проверяет, попал ли центр bbox в центральный коридор.
+    """
+    x1, y1, x2, y2 = bbox
+    center_x = x1 + (x2 - x1) // 2
+
+    zone_start_px = int(frame_width * CENTER_ZONE_START_X)
+    zone_end_px = int(frame_width * CENTER_ZONE_END_X)
+
+    in_zone = zone_start_px < center_x < zone_end_px
+    return in_zone, center_x, zone_start_px, zone_end_px
+
+
+_last_center_x = None
+
+
+def is_moving_left_to_right(current_center_x: int) -> bool:
+    """
+    True, если объект движется слева направо.
+    """
+    global _last_center_x
+
+    moved_right = False
+    if _last_center_x is not None:
+        if current_center_x - _last_center_x > MIN_DIRECTION_DELTA:
+            moved_right = True
+
+    _last_center_x = current_center_x
+    return moved_right
+
+
+def save_frame(frame: np.ndarray):
+    """
+    Сохранить кадр в snapshots/YYYY-MM-DD/HH-MM-SS.jpg.
+    """
+    now = datetime.now()
+    date_dir = os.path.join(SNAPSHOT_BASE_DIR, now.strftime("%Y-%m-%d"))
+    os.makedirs(date_dir, exist_ok=True)
+
+    filename = now.strftime("%H-%M-%S") + ".jpg"
+    path = os.path.join(date_dir, filename)
+
+    cv2.imwrite(path, frame)
+    return path, now
+
+
+def analyze_snow_gemini(image_path: str) -> dict:
+    """
+    Анализ объёма снега в кузове через Gemini.
+    """
+    image = Image.open(image_path)
+
+    prompt = (
+        "На изображении находится грузовой автомобиль (КАМАЗ) с кузовом, "
+        "в котором лежит снег. "
+        "Оцени, на сколько процентов от объёма кузов заполнен снегом (0-100). "
+        "Верни строго JSON без дополнительного текста с полями:\n"
+        '{\n'
+        '  "percentage": <целое число 0-100>,\n'
+        '  "confidence": <число от 0 до 1>\n'
+        '}'
+    )
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[image, prompt],
+    )
+
+    text = response.text or ""
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {"raw": text}
+
+    return data
+
+
+def save_analysis_json(image_path: str, timestamp: datetime, gemini_result: dict) -> str:
+    """
+    Сохранить результат анализа рядом с изображением.
+    """
+    json_path = image_path.rsplit(".", 1)[0] + ".json"
+
+    payload = {
+        "timestamp": timestamp.isoformat(),
+        "image_path": image_path,
+        "gemini": gemini_result,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return json_path
+
+
+def send_event_to_backend(image_paths, gemini_result: dict, timestamp: datetime):
+    """
+    Отправляет событие на SnowOps backend:
+    - поле event: JSON-строка
+    - поле photos: файлы фотографий
+    """
+    # аккуратно достаём процент и confidence
+    percentage = None
+    confidence = None
+
+    if isinstance(gemini_result, dict):
+        p = gemini_result.get("percentage")
+        c = gemini_result.get("confidence")
+        try:
+            if p is not None:
+                percentage = int(round(float(p)))
+        except Exception:
+            pass
+        try:
+            if c is not None:
+                confidence = float(c)
+        except Exception:
+            pass
+
+    event_payload = {
+        "camera_id": CAMERA_ID,
+        "event_time": timestamp.isoformat(),
+        # далее можно добавить plate, anpr_source и т.д.
+        "snow_volume_percentage": percentage,
+        "snow_volume_confidence": confidence,
+    }
+
+    # Формируем files для multipart/form-data
+    files = []
+    file_handles = []
+    for path in image_paths:
+        try:
+            f = open(path, "rb")
+            file_handles.append(f)
+            files.append(
+                ("photos", (os.path.basename(path), f, "image/jpeg"))
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось открыть файл {path} для отправки: {e}")
+
+    data = {
+        "event": json.dumps(event_payload, ensure_ascii=False)
+    }
+
+    print("📡 Отправляем событие на backend...")
+    try:
+        resp = requests.post(
+            BACKEND_ENDPOINT,
+            data=data,
+            files=files,
+            timeout=15,
+        )
+        print(f"✅ Backend ответ: {resp.status_code}")
+        try:
+            print("Ответ body:", resp.text[:500])
+        except Exception:
+            pass
+    except Exception as e:
+        print("❌ Ошибка отправки на backend:", e)
+    finally:
+        for f in file_handles:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+event_sent_for_current_truck = False
 
 
 def process_video_stream():
-    cap = cv2.VideoCapture(VIDEO_SOURCE_URL)
+    global event_sent_for_current_truck, _last_center_x
 
+    model = init_model()
+
+    cap = cv2.VideoCapture(VIDEO_SOURCE_URL)
     if not cap.isOpened():
-        print(f"Не работает хуйня {VIDEO_SOURCE_URL}")
+        print("❌ Не удалось открыть видеопоток:", VIDEO_SOURCE_URL)
         return
 
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    center_start_pixel = int(frame_width * CENTER_ZONE_START_X)
-    center_end_pixel = int(frame_width * CENTER_ZONE_END_X)
-    
-    print(f"центр {center_start_pixel} {center_end_pixel}px")
+    window_name = "Video Stream Analysis"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
-    current_truck_history = [] 
-    truck_has_been_processed = False 
+    print("✅ Старт анализа видеопотока... Нажми 'q' для выхода.")
+
+    frame_width = None
+    frame_height = None
+    center_start_pixel = None
+    center_end_pixel = None
+    center_x_geom = None
+
+    fail_count = 0
+    MAX_FAILS = 50  # после 50 подряд неудач — переподключаемся
 
     while True:
         ret, frame = cap.read()
-        if not ret:
+
+        # сначала проверяем, что кадр живой
+        if not ret or frame is None or frame.size == 0:
+            fail_count += 1
+            print(f"⚠️ Не удалось прочитать кадр (fail={fail_count})")
+
+            if fail_count >= MAX_FAILS:
+                print("🔁 Слишком много ошибок чтения, переподключаемся к камере...")
+                cap.release()
+                time.sleep(2)
+                cap = cv2.VideoCapture(VIDEO_SOURCE_URL)
+                fail_count = 0
+
+            if cv2.waitKey(10) & 0xFF == ord("q"):
+                break
             continue
-        
-        results = yolo_model(frame, verbose=False, conf=CONFIDENCE_THRESHOLD, classes=[TRUCK_CLASS_ID])
-        truck_bbox = None
-        
-        if results and results[0].boxes and len(results[0].boxes) > 0:
-            box = results[0].boxes[0]
-            truck_bbox = box.xyxy[0].tolist()
-        
-        center_x = frame_width // 2 
-        cv2.line(frame, (center_x, 0), (center_x, frame_height), (0, 255, 255), 1) 
-        cv2.line(frame, (center_start_pixel, 0), (center_start_pixel, frame_height), (0, 255, 0), 2)
-        cv2.line(frame, (center_end_pixel, 0), (center_end_pixel, frame_height), (0, 255, 0), 2)
+
+        # теперь можно делать копию «сытого» кадра
+        raw_frame = frame.copy()
+        fail_count = 0
+
+        if frame_width is None:
+            frame_height, frame_width = frame.shape[:2]
+            center_start_pixel = int(frame_width * CENTER_ZONE_START_X)
+            center_end_pixel = int(frame_width * CENTER_ZONE_END_X)
+            center_x_geom = int(frame_width * CENTER_LINE_X)
+            print(f"Центральный коридор: {center_start_pixel}px .. {center_end_pixel}px")
+
+        # линии
+        cv2.line(frame, (center_x_geom, 0), (center_x_geom, frame_height),
+                 (0, 255, 255), 1)
+        cv2.line(frame, (center_start_pixel, 0), (center_start_pixel, frame_height),
+                 (0, 255, 0), 2)
+        cv2.line(frame, (center_end_pixel, 0), (center_end_pixel, frame_height),
+                 (0, 255, 0), 2)
+
+        # детекция делаем по raw_frame (без линий и прямоугольников)
+        truck_bbox = detect_truck_bbox(raw_frame, model)
 
         if truck_bbox:
+            in_zone, center_x_obj, _, _ = check_center_zone(truck_bbox, frame_width)
             x1, y1, x2, y2 = truck_bbox
-            w = x2 - x1
-            object_center_x = x1 + w // 2
-            
-            current_truck_history.append(object_center_x)
-            if len(current_truck_history) > MAX_HISTORY:
-                 current_truck_history.pop(0) 
-            
-            direction = determine_direction_by_history(current_truck_history)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-            is_in_center = center_start_pixel < object_center_x < center_end_pixel
-            is_moving_right = direction == "Вправо"
-            is_direction_known = direction != "Неизвестно"
+            moving_right = is_moving_left_to_right(center_x_obj)
 
-            if is_in_center and is_moving_right and is_direction_known and not truck_has_been_processed:
-                
-                cargo_bbox = get_cargo_bbox(truck_bbox, direction)
-                cx1, cy1, cx2, cy2 = cargo_bbox
-                volume = calculate_snow_volume(frame, cargo_bbox)
-                
-                timestamp = time.strftime("%Y%m%d%H%M%S")
-                snapshot_path = os.path.join(SNAPSHOT_DIR, f"capture_{timestamp}.jpg")
-                
-                result_text = f"Volume: {round(volume * 100)}% | Dir: {direction}"
-                cv2.putText(frame, result_text, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                cv2.rectangle(frame, (int(cx1), int(cy1)), (int(cx2), int(cy2)), (0, 255, 255), 2) 
+            # сработать только ОДИН раз за проход
+            if in_zone and moving_right and not event_sent_for_current_truck:
+                print("🚛 КамАЗ в коридоре и движется слева-направо — сохраняем и анализируем.")
+                image_path, ts = save_frame(raw_frame)
+                print("💾 Кадр сохранён:", image_path)
 
-                cv2.imwrite(snapshot_path, frame)
-                
-                analysis_result = {
-                    "timestamp": timestamp,
-                    "НаправлениеКабины": direction,
-                    "ОценкаОбъема": round(volume, 2),
-                    "Комментарий": f"Объем: {round(volume*100)}%, Направление: {direction}",
-                }
-                
-                print(f"\n--- Грузовик (Направление: {direction}) захвачен в центре: {timestamp} ---")
-                print(json.dumps(analysis_result, indent=4, ensure_ascii=False))
-                
-                truck_has_been_processed = True 
-            
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-            cv2.putText(frame, f"Tracking: {direction}", (int(x1), int(y2) + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        
+                gemini_result = analyze_snow_gemini(image_path)
+                print("📊 Результат Gemini:", gemini_result)
+
+                save_analysis_json(image_path, ts, gemini_result)
+
+                send_event_to_backend([image_path], gemini_result, ts)
+
+                event_sent_for_current_truck = True
+
         else:
-            current_truck_history = []
-            truck_has_been_processed = False 
-        
+            # грузовик пропал — готовимся к новому событию
+            event_sent_for_current_truck = False
+            _last_center_x = None
+
         resized_frame = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-        cv2.imshow('Video Stream Analysis', resized_frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow(window_name, resized_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:
+            break
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
     cap.release()
     cv2.destroyAllWindows()
+    print("✅ Работа завершена.")
 
-if __name__ == '__main__':
-    print(f"пашет,пашет")
+
+if __name__ == "__main__":
     process_video_stream()
