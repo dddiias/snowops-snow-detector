@@ -54,8 +54,7 @@ CAMERA_ID = "camera-001"   # поменяешь на реальный ID кам�
 
 
 def init_model() -> YOLO:
-    model = YOLO(YOLO_MODEL_PATH)
-    return model
+    return YOLO(YOLO_MODEL_PATH)
 
 
 def detect_truck_bbox(frame: np.ndarray, model: YOLO):
@@ -109,6 +108,7 @@ _last_center_x = None
 def is_moving_left_to_right(current_center_x: int) -> bool:
     """
     True, если объект движется слева направо.
+    ЛОГИКА КАК В РАБОТАВШЕМ ВАРИАНТЕ.
     """
     global _last_center_x
 
@@ -138,34 +138,51 @@ def save_frame(frame: np.ndarray):
 
 def analyze_snow_gemini(image_path: str) -> dict:
     """
-    Анализ объёма снега в кузове через Gemini.
+    Анализ объёма снега и направления движения по картинке через Gemini.
+    Возвращает dict, при ошибке — {"error": "..."}.
     """
-    image = Image.open(image_path)
-
-    prompt = (
-        "На изображении находится грузовой автомобиль (КАМАЗ) с кузовом, "
-        "в котором лежит снег. "
-        "Оцени, на сколько процентов от объёма кузов заполнен снегом (0-100). "
-        "Верни строго JSON без дополнительного текста с полями:\n"
-        '{\n'
-        '  "percentage": <целое число 0-100>,\n'
-        '  "confidence": <число от 0 до 1>\n'
-        '}'
-    )
-
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[image, prompt],
-    )
-
-    text = response.text or ""
-
     try:
-        data = json.loads(text)
-    except Exception:
-        data = {"raw": text}
+        image = Image.open(image_path)
 
-    return data
+        prompt = (
+            "На изображении находится грузовой автомобиль (КАМАЗ или похожий) с кузовом.\n"
+            "1) Оцени, на сколько процентов от объёма кузов заполнен снегом (0-100).\n"
+            "2) Определи НАПРАВЛЕНИЕ движения грузовика по дорожным следам, положению колёс и фону.\n"
+            "Возможные значения направления:\n"
+            '  - \"left_to_right\" — если грузовик едет слева направо\n'
+            '  - \"right_to_left\" — если грузовик едет справа налево\n'
+            '  - \"unknown\" — если направление определить нельзя\n\n'
+            "Важно: верни СТРОГО один JSON-объект БЕЗ ``` и любого лишнего текста:\n"
+            '{\n'
+            '  "percentage": 0,\n'
+            '  "confidence": 0.0,\n'
+            '  "direction": "left_to_right"\n'
+            "}\n"
+        )
+
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[image, prompt],
+        )
+
+        text = (response.text or "").strip()
+
+        # на всякий случай срезаем ```json ... ```
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = {"raw": text}
+
+        return data
+
+    except Exception as e:
+        print(f"[GEMINI] error: {e}")
+        return {"error": str(e)}
 
 
 def save_analysis_json(image_path: str, timestamp: datetime, gemini_result: dict) -> str:
@@ -186,36 +203,74 @@ def save_analysis_json(image_path: str, timestamp: datetime, gemini_result: dict
     return json_path
 
 
-def send_event_to_backend(image_paths, gemini_result: dict, timestamp: datetime):
+def _extract_gemini_fields(gemini_result: dict):
     """
-    Отправляет событие на SnowOps backend:
-    - поле event: JSON-строка
-    - поле photos: файлы фотографий
+    Достаём percentage, confidence, direction из ответа Gemini.
+    Умеет парсить и поле raw с ```json ...``` при необходимости.
     """
-    # аккуратно достаём процент и confidence
     percentage = None
     confidence = None
+    direction = None
 
-    if isinstance(gemini_result, dict):
-        p = gemini_result.get("percentage")
-        c = gemini_result.get("confidence")
+    if not isinstance(gemini_result, dict):
+        return percentage, confidence, direction
+
+    p = gemini_result.get("percentage")
+    c = gemini_result.get("confidence")
+    d = gemini_result.get("direction")
+    raw = gemini_result.get("raw")
+
+    # если чего-то нет — пробуем распарсить raw
+    if (p is None or c is None or d is None) and raw:
+        raw_s = str(raw).strip()
         try:
-            if p is not None:
-                percentage = int(round(float(p)))
+            if raw_s.startswith("```"):
+                raw_s = raw_s.strip("`")
+                if raw_s.lower().startswith("json"):
+                    raw_s = raw_s[4:].strip()
+            parsed = json.loads(raw_s)
+            if p is None:
+                p = parsed.get("percentage")
+            if c is None:
+                c = parsed.get("confidence")
+            if d is None:
+                d = parsed.get("direction")
         except Exception:
             pass
-        try:
-            if c is not None:
-                confidence = float(c)
-        except Exception:
-            pass
+
+    try:
+        if p is not None:
+            percentage = int(round(float(p)))
+    except Exception:
+        pass
+
+    try:
+        if c is not None:
+            confidence = float(c)
+    except Exception:
+        pass
+
+    if d is not None:
+        direction = str(d).strip().lower()
+
+    return percentage, confidence, direction
+
+
+def send_event_to_backend(image_paths, gemini_result: dict, timestamp: datetime):
+    """
+    Отправляет событие на SnowOps backend.
+    Если Gemini говорит, что машинка НЕ слева-направо —
+    событие не отправляем.
+    """
+    percentage, confidence, direction = _extract_gemini_fields(gemini_result)
 
     event_payload = {
         "camera_id": CAMERA_ID,
-        "event_time": timestamp.isoformat(),
-        # далее можно добавить plate, anpr_source и т.д.
+        "event_time": timestamp.replace(microsecond=0).isoformat() + "Z",
         "snow_volume_percentage": percentage,
         "snow_volume_confidence": confidence,
+        # просто логируем, но не используем как фильтр
+        "snow_direction_ai": direction,
     }
 
     # Формируем files для multipart/form-data
@@ -225,17 +280,12 @@ def send_event_to_backend(image_paths, gemini_result: dict, timestamp: datetime)
         try:
             f = open(path, "rb")
             file_handles.append(f)
-            files.append(
-                ("photos", (os.path.basename(path), f, "image/jpeg"))
-            )
+            files.append(("photos", (os.path.basename(path), f, "image/jpeg")))
         except Exception as e:
-            print(f"⚠️ Не удалось открыть файл {path} для отправки: {e}")
+            print(f"[UPSTREAM] warning: cannot open file {path}: {e}")
 
-    data = {
-        "event": json.dumps(event_payload, ensure_ascii=False)
-    }
+    data = {"event": json.dumps(event_payload, ensure_ascii=False)}
 
-    print("📡 Отправляем событие на backend...")
     try:
         resp = requests.post(
             BACKEND_ENDPOINT,
@@ -243,13 +293,13 @@ def send_event_to_backend(image_paths, gemini_result: dict, timestamp: datetime)
             files=files,
             timeout=15,
         )
-        print(f"✅ Backend ответ: {resp.status_code}")
-        try:
-            print("Ответ body:", resp.text[:500])
-        except Exception:
-            pass
+        status = resp.status_code
+        body = resp.text.strip().replace("\n", "")
+        print(f"[UPSTREAM] status={status}, body={body}")
+        return status, body
     except Exception as e:
-        print("❌ Ошибка отправки на backend:", e)
+        print(f"[UPSTREAM] network_error={e}")
+        return None, str(e)
     finally:
         for f in file_handles:
             try:
@@ -333,6 +383,9 @@ def process_video_stream():
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
             moving_right = is_moving_left_to_right(center_x_obj)
+            print(f"[DBG] center_x={center_x_obj}, last_center={_last_center_x}, "
+                f"moving_right={moving_right}, in_zone={in_zone}")
+
 
             # сработать только ОДИН раз за проход
             if in_zone and moving_right and not event_sent_for_current_truck:

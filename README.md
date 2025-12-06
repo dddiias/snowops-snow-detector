@@ -1,58 +1,65 @@
 # Snow Detector
 
-Сервис читает RTSP-видеопоток, детектирует грузовики моделью YOLOv8n и по проходу через центральный коридор делает снимок. Снимок анализируется в Google Gemini (`gemini-2.5-flash`) для оценки заполнения кузова снегом. Результат сохраняется локально и отправляется на backend SnowOps в виде multipart-запроса с JSON и фото.
+Сервис отслеживает грузовики в RTSP-потоке, оценивает объём снега на кузове через Gemini и отправляет событие в SnowOps backend вместе со снимком.
 
-## Требования
-- Python 3.10+.
-- FFmpeg в PATH (желательно для стабильной работы `opencv-python` с RTSP).
-- Файл весов `yolov8n.pt` рядом с `main.py` (присутствует в репозитории).
-- Переменная окружения `GEMINI_API_KEY` (проверяется при старте).
-
-## Установка
+## Быстрый запуск
+- Python 3.10+, ffmpeg в `PATH` (для RTSP через OpenCV), файл весов `yolov8n.pt` рядом с `main.py`.
+- Установить зависимости:
 ```bash
 python -m venv .venv
 .\.venv\Scripts\activate   # Linux/macOS: source .venv/bin/activate
 pip install -r requirements.txt
 ```
+- Скопировать `sample_env` в `.env` и прописать `GEMINI_API_KEY=<ваш ключ>`.
+- Запуск: `python main.py` (закрыть окно — `q` или `Esc`).
 
 ## Настройка
-1) Скопируйте `sample_env` в `.env`.
-2) Пропишите ключ: `GEMINI_API_KEY=<ваш_ключ>`.
-3) При необходимости поправьте параметры в `main.py`:
-   - `VIDEO_SOURCE_URL` — RTSP-URL камеры.
-   - `CENTER_ZONE_START_X` / `CENTER_ZONE_END_X` / `CENTER_LINE_X` — доли ширины кадра, задающие центральный коридор.
-   - `MIN_DIRECTION_DELTA` — минимальный сдвиг по X, чтобы считать движение вправо.
-   - `CONFIDENCE_THRESHOLD`, `TRUCK_CLASS_ID` — пороги детекции.
-   - `SNAPSHOT_BASE_DIR` — куда сохранять снимки и JSON.
-   - `BACKEND_ENDPOINT`, `CAMERA_ID` — адрес и идентификатор камеры для отправки события.
-   - `GEMINI_MODEL` — модель Gemini.
+Все настраиваемые параметры в `main.py`:
+- `VIDEO_SOURCE_URL` — RTSP-адрес камеры.
+- `YOLO_MODEL_PATH` — путь к весам YOLOv8.
+- `TRUCK_CLASS_ID` / `CONFIDENCE_THRESHOLD` — класс «truck» (COCO: 7) и порог уверенности.
+- `CENTER_ZONE_START_X` / `CENTER_ZONE_END_X` / `CENTER_LINE_X` — доли ширины кадра, задающие центральную зону и контрольную линию.
+- `MIN_DIRECTION_DELTA` — минимальное смещение центра bbox по X между кадрами, чтобы считать движение слева направо.
+- `SNAPSHOT_BASE_DIR` — директория для снимков и JSON с результатами.
+- `GEMINI_MODEL` — модель Gemini для анализа.
+- `BACKEND_ENDPOINT` / `CAMERA_ID` — куда и с каким ID отправлять событие в SnowOps.
 
-## Запуск
-```bash
-python main.py
+## Логика работы
+1. Открывается RTSP-поток `VIDEO_SOURCE_URL` и создаётся окно отображения (`DISPLAY_WIDTH/HEIGHT`).
+2. На каждом кадре YOLOv8 ищет грузовики (class 7). Берётся bbox с максимальной площадью и уверенностью ≥ `CONFIDENCE_THRESHOLD`.
+3. Центр bbox сверяется с центральной зоной (`CENTER_ZONE_START_X..END_X`). Движение слева направо фиксируется, если сдвиг центра > `MIN_DIRECTION_DELTA`.
+4. При первом срабатывании условия «грузовик в зоне и движется слева направо»:
+   - Сохраняется кадр `snapshots/YYYY-MM-DD/HH-MM-SS.jpg`.
+   - Gemini (`GEMINI_MODEL`) получает снимок и возвращает JSON вида `{percentage, confidence, direction}`; если формат иной, оригинал пишется в `raw`.
+   - В `snapshots/.../HH-MM-SS.json` сохраняются `timestamp`, `image_path`, `gemini`.
+   - Отправляется событие в SnowOps backend.
+5. Пока грузовик виден, повторные события не шлются; флаг сбрасывается, когда детекции нет.
+
+## Что отправляется в SnowOps
+POST `multipart/form-data` на `BACKEND_ENDPOINT`.
+- Поле `event`: JSON-строка
+```json
+{
+  "camera_id": "camera-001",
+  "event_time": "2025-12-06T12:34:56Z",
+  "snow_volume_percentage": 42,
+  "snow_volume_confidence": 0.91,
+  "snow_direction_ai": "left_to_right"
+}
 ```
-Окно OpenCV закроется по `q` или `Esc`. После 50 подряд неудачных чтений поток переподключается.
+  - `event_time` — время фиксации кадра в локальном времени машины (микросекунды отброшены); суффикс `Z` просто добавляется, перевод в UTC не выполняется.
+  - `snow_volume_*` могут быть `null`, если ответ Gemini не разобрался.
+  - `snow_direction_ai` принимает `left_to_right` / `right_to_left` / `unknown`.
+- Поле(я) `photos`: один или несколько файлов `image/jpeg` с кадром(ами) из `snapshots/` (сервис отправляет один).
 
-## Как работает
-- Читает кадры из `VIDEO_SOURCE_URL`.
-- YOLOv8n ищет грузовики; берётся крупнейший бокс с доверием выше порога.
-- Проверяется движение слева направо (`MIN_DIRECTION_DELTA`) и попадание центра бокса в центральный коридор (`CENTER_ZONE_START_X..END_X`).
-- При первом срабатывании для текущего грузовика (флаг `event_sent_for_current_truck`):
-  - сохраняет «сырой» кадр в `snapshots/YYYY-MM-DD/HH-MM-SS.jpg`;
-  - отправляет кадр в Gemini, ожидая JSON вида `{percentage, confidence}`; если распарсить не удалось — сохраняется `{"raw": "<ответ>"}`;
-  - пишет результат рядом в `snapshots/.../HH-MM-SS.json` с `timestamp`, `image_path`, `gemini`;
-  - отправляет событие на `BACKEND_ENDPOINT` (multipart/form-data): поле `event` с JSON (`camera_id`, `event_time`, `snow_volume_percentage`, `snow_volume_confidence`) и файлы `photos` с кадром.
-- В окне рисуются направляющие линии и бокс детекции.
-- Когда объект пропадает, флаг сбрасывается, и следующий грузовик снова даст одно срабатывание.
+Пример ручной отправки сохранённого кадра:
+```bash
+curl -X POST https://snowops-anpr-service.onrender.com/api/v1/anpr/events ^
+  -F "event={\"camera_id\":\"camera-001\",\"event_time\":\"2025-12-06T12:34:56Z\",\"snow_volume_percentage\":42,\"snow_volume_confidence\":0.91,\"snow_direction_ai\":\"left_to_right\"}" ^
+  -F "photos=@snapshots/2025-12-06/12-34-56.jpg;type=image/jpeg"
+```
 
-## Особенности и ограничения
-- Логика заточена под движение слева направо; для обратного направления измените `is_moving_left_to_right` и границы коридора.
-- `_last_center_x` сбрасывается только при потере объекта; если поток пропадает, возможны редкие ложные «не движется вправо».
-- Отправляется один event на проход (пока грузовик виден). Новая серия появится после потери/возврата объекта.
-- Некоторые строки логов можно привести к UTF-8 для читаемости — на работу не влияет.
-
-## Быстрый чек
-1) Активируйте venv, установите зависимости.
-2) Создайте `.env` с `GEMINI_API_KEY`.
-3) Проверьте доступность RTSP-URL.
-4) Запустите `python main.py`; дождитесь появления грузовика в коридоре — в `snapshots/<дата>/` появятся `.jpg` и `.json`, а в консоли — ответ Gemini и статус отправки на backend.
+## Полезное
+- Все снимки и результаты анализа складываются в `snapshots/` (каталог исключён из git).
+- При проблемах с RTSP поток переподключается после 50 неудачных чтений кадров.
+- Завершение работы — закрытие окна, `q` или `Esc`.
